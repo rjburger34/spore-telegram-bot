@@ -1,0 +1,133 @@
+import os
+from telegram import Update
+from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from openai import OpenAI
+
+# --- Load config from environment variables ---
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "")  # e.g. SporeLoreBot (NO @)
+
+if not TELEGRAM_TOKEN:
+    print("ERROR: TELEGRAM_BOT_TOKEN env var is not set.")
+if not OPENAI_API_KEY:
+    print("ERROR: OPENAI_API_KEY env var is not set.")
+if not BOT_USERNAME:
+    print("ERROR: BOT_USERNAME env var is not set.")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# --- Load community lore / history file ---
+try:
+    with open("knowledge/community_history.md", "r", encoding="utf-8") as f:
+        COMMUNITY_HISTORY = f.read()
+except FileNotFoundError:
+    COMMUNITY_HISTORY = "No community history file yet. Add knowledge/community_history.md."
+
+
+def message_mentions_bot(message_text: str, entities, bot_username: str) -> bool:
+    """Return True if the message explicitly @mentions this bot."""
+    if not entities or not message_text:
+        return False
+
+    for ent in entities:
+        if ent.type == "mention":
+            mention_text = message_text[ent.offset : ent.offset + ent.length]
+            if mention_text.lstrip("@").lower() == bot_username.lower():
+                return True
+    return False
+
+
+async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if msg is None or msg.text is None:
+        return
+
+    text = msg.text
+
+    # 1) Trigger on @mention
+    mentioned = message_mentions_bot(text, msg.entities, BOT_USERNAME)
+
+    # 2) Trigger if user is replying directly to the bot
+    is_reply_to_bot = (
+        msg.reply_to_message is not None
+        and msg.reply_to_message.from_user is not None
+        and msg.reply_to_message.from_user.id == context.bot.id
+    )
+
+    if not (mentioned or is_reply_to_bot):
+        # Ignore everything else in the group
+        return
+
+    # Build the question we send to the LLM
+    if mentioned:
+        clean_question = text.replace(f"@{BOT_USERNAME}", "").strip()
+    else:
+        clean_question = text.strip()
+
+    if not clean_question:
+        clean_question = "They pinged you without any text. Say hi and explain what you can do."
+
+    user_handle = msg.from_user.username or msg.from_user.first_name
+
+    # --- System prompt (personality + knowledge) ---
+    system_prompt = (
+        "You are Spore, a semi-sentient mushroom archivist and lore keeper for an "
+        "ERC-20i / Base Telegram community.\n"
+        "- You speak like a friendly crypto degen (CT tone) but avoid toxicity and slurs.\n"
+        "- You explain the community's history, culture, key events, memes, and how things work.\n"
+        "- Keep replies short and group-chat friendly (1–3 short paragraphs or a few lines).\n"
+        "- If you don't know something, say you're not sure and suggest asking mods or checking official links.\n\n"
+        "Here is background context about the community:\n"
+        f"{COMMUNITY_HISTORY}\n\n"
+        "Use this context when helpful, but don't dump it all at once."
+    )
+
+    user_prompt = (
+        f"Telegram user @{user_handle} asked or said:\n"
+        f"{clean_question}\n\n"
+        "Reply as Spore in a busy group chat. Address them directly, keep it casual and concise."
+    )
+
+    # --- Call OpenAI LLM ---
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4.1-mini",  # or gpt-4.1-nano if you want cheaper
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=250,
+            temperature=0.8,
+        )
+        reply_text = completion.choices[0].message.content.strip()
+    except Exception as e:
+        print("OpenAI error:", e)
+        reply_text = "My spores are clogged rn, try again in a bit."
+
+    # Reply to the user in chat
+    await msg.reply_text(f"@{user_handle} {reply_text}")
+
+
+import asyncio  # make sure this is present somewhere near the top of the file
+
+def main():
+    # Create and set an explicit event loop (needed for Python 3.14)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    if not TELEGRAM_TOKEN or not OPENAI_API_KEY or not BOT_USERNAME:
+        print("Missing required environment variables. Exiting.")
+        return
+
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # Listen to all text messages; our handler decides when to respond
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat))
+
+    print("Spore Telegram agent is running...")
+    app.run_polling()  # uses the loop we just set
+
+
+if __name__ == "__main__":
+    main()
