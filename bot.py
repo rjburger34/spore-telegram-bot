@@ -18,11 +18,25 @@ if not BOT_USERNAME:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # --- Load community lore / history file ---
-try:
-    with open("knowledge/community_history.md", "r", encoding="utf-8") as f:
-        COMMUNITY_HISTORY = f.read()
-except FileNotFoundError:
-    COMMUNITY_HISTORY = "No community history file yet. Add knowledge/community_history.md."
+# --- Load all knowledge files from /knowledge ---
+def load_knowledge():
+    knowledge_dir = "knowledge"
+    parts = []
+    if os.path.isdir(knowledge_dir):
+        for name in sorted(os.listdir(knowledge_dir)):
+            if name.lower().endswith(".md"):
+                path = os.path.join(knowledge_dir, name)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    parts.append(f"# From {name}\n\n{content}")
+                except Exception as e:
+                    print(f"Could not read {path}: {e}")
+    if not parts:
+        return "No knowledge files yet. Add .md files under the knowledge/ folder."
+    return "\n\n---\n\n".join(parts)
+
+KNOWLEDGE = load_knowledge()
 
 
 def message_mentions_bot(message_text: str, entities, bot_username: str) -> bool:
@@ -72,16 +86,16 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- System prompt (personality + knowledge) ---
     system_prompt = (
-        "You are Spore, a semi-sentient mushroom archivist and lore keeper for an "
-        "ERC-20i / Base Telegram community.\n"
-        "- You speak like a friendly crypto degen (CT tone) but avoid toxicity and slurs.\n"
-        "- You explain the community's history, culture, key events, memes, and how things work.\n"
-        "- Keep replies short and group-chat friendly (1–3 short paragraphs or a few lines).\n"
-        "- If you don't know something, say you're not sure and suggest asking mods or checking official links.\n\n"
-        "Here is background context about the community:\n"
-        f"{COMMUNITY_HISTORY}\n\n"
-        "Use this context when helpful, but don't dump it all at once."
-    )
+    "You are Spore, a semi-sentient mushroom archivist and lore keeper for an "
+    "ERC-20i / Base Telegram community.\n"
+    "- You speak like a friendly crypto degen (CT tone) but stay helpful and positive.\n"
+    "- You explain the community's history, culture, key events, characters, memes, links, and tools.\n"
+    "- Keep replies short and group-chat friendly (1–3 short paragraphs or a few lines).\n"
+    "- If you don't know something, say you're not sure and suggest asking mods or checking official resources.\n\n"
+    "Below is ALL community knowledge loaded from the /knowledge folder, including history, links, docs, characters, memes, FAQs, and ecosystem info:\n\n"
+    f"{KNOWLEDGE}\n\n"
+    "Use this knowledge when helpful. If a user asks for official links, socials, website, docs, or tools, pull the answer directly from the links.md file."
+)
 
     user_prompt = (
         f"Telegram user @{user_handle} asked or said:\n"
