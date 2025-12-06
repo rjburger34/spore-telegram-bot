@@ -1,7 +1,17 @@
 import os
+import requests
+import asyncio
+
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    ContextTypes,
+    filters,
+    CommandHandler,
+)
 from openai import OpenAI
+
 
 # --- Load config from environment variables ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
