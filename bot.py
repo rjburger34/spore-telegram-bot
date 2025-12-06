@@ -27,7 +27,6 @@ if not BOT_USERNAME:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Load community lore / history file ---
 # --- Load all knowledge files from /knowledge ---
 def load_knowledge():
     knowledge_dir = "knowledge"
@@ -50,8 +49,6 @@ KNOWLEDGE = load_knowledge()
 
 # --- Price config and fetcher ---
 
-import requests  # Required for API calls
-
 TOKEN_CONFIG = {
     "BTC": {"id": "bitcoin", "label": "Bitcoin"},
     "ETH": {"id": "ethereum", "label": "Ethereum"},
@@ -60,7 +57,6 @@ TOKEN_CONFIG = {
     "PEPI": {"id": "pepi-2", "label": "Pepi"},
     "JELLI": {"id": "jelli", "label": "Jelli"},
 }
-
 
 COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
 
@@ -101,6 +97,94 @@ def fetch_prices():
         }
 
     return results
+
+
+# --- Natural-language price detection helpers ---
+
+# Map canonical symbols (keys from TOKEN_CONFIG) to aliases people will type
+TOKEN_ALIASES = {
+    "BTC": ["btc", "$btc", "bitcoin"],
+    "ETH": ["eth", "$eth", "ethereum"],
+    "FUNGI": ["fungi", "$fungi"],
+    "FROGGI": ["froggi", "$froggi"],
+    "PEPI": ["pepi", "$pepi"],
+    "JELLI": ["jelli", "$jelli"],
+}
+
+PRICE_KEYWORDS = [
+    "price",
+    "how much",
+    "worth",
+    "cost",
+    "trading at",
+    "going for",
+    "quote",
+]
+
+
+def extract_price_request_tokens(message_text: str) -> list[str]:
+    """
+    Returns a list of canonical token symbols (e.g. ["FUNGI", "PEPI"])
+    if the message looks like a price request for those tokens.
+    """
+    if not message_text:
+        return []
+
+    text = message_text.lower()
+
+    # Only treat it as a price query if at least one keyword appears
+    if not any(keyword in text for keyword in PRICE_KEYWORDS):
+        return []
+
+    requested = []
+    for symbol, aliases in TOKEN_ALIASES.items():
+        for alias in aliases:
+            if alias in text:
+                requested.append(symbol)
+                break  # don't double-add the same symbol
+
+    return requested
+
+
+def build_price_line(requested_symbols: list[str]) -> str | None:
+    """
+    Uses fetch_prices() and returns a single-line string like:
+    'FUNGI: $0.012345 | PEPI: $0.004200'
+    Only includes tokens that were successfully priced.
+    """
+    if not requested_symbols:
+        return None
+
+    all_prices = fetch_prices()
+    if not all_prices:
+        return None
+
+    parts = []
+    for symbol in requested_symbols:
+        symbol = symbol.upper()
+        info = all_prices.get(symbol)
+        if not info:
+            continue
+
+        price = info.get("price")
+        if price is None:
+            continue
+
+        # Format price
+        if price >= 1:
+            price_str = f"${price:,.2f}"
+        else:
+            price_str = f"${price:.6f}"
+
+        parts.append(f"{symbol}: {price_str}")
+
+    if not parts:
+        return None
+
+    return " | ".join(parts)
+
+
+# --- Core helpers ---
 
 
 def message_mentions_bot(message_text: str, entities, bot_username: str) -> bool:
@@ -148,18 +232,29 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_handle = msg.from_user.username or msg.from_user.first_name
 
+    # --- Natural-language price handling ---
+    requested_symbols = extract_price_request_tokens(clean_question)
+    if requested_symbols:
+        price_line = build_price_line(requested_symbols)
+        if price_line:
+            # Single-line price response, tagged to the user
+            await msg.reply_text(f"@{user_handle} {price_line}")
+            return
+        # If it *looked* like a price request but we couldn't fetch anything,
+        # fall through to the normal LLM reply.
+
     # --- System prompt (personality + knowledge) ---
     system_prompt = (
-    "You are Spore, a semi-sentient mushroom archivist and lore keeper for an "
-    "ERC-20i / Base Telegram community.\n"
-    "- You speak like a friendly crypto degen (CT tone) but stay helpful and positive.\n"
-    "- You explain the community's history, culture, key events, characters, memes, links, and tools.\n"
-    "- Keep replies short and group-chat friendly (1–3 short paragraphs or a few lines).\n"
-    "- If you don't know something, say you're not sure and suggest asking mods or checking official resources.\n\n"
-    "Below is ALL community knowledge loaded from the /knowledge folder, including history, links, docs, characters, memes, FAQs, and ecosystem info:\n\n"
-    f"{KNOWLEDGE}\n\n"
-    "Use this knowledge when helpful. If a user asks for official links, socials, website, docs, or tools, pull the answer directly from the links.md file."
-)
+        "You are Spore, a semi-sentient mushroom archivist and lore keeper for an "
+        "ERC-20i / Base Telegram community.\n"
+        "- You speak like a friendly crypto degen (CT tone) but stay helpful and positive.\n"
+        "- You explain the community's history, culture, key events, characters, memes, links, and tools.\n"
+        "- Keep replies short and group-chat friendly (1–3 short paragraphs or a few lines).\n"
+        "- If you don't know something, say you're not sure and suggest asking mods or checking official resources.\n\n"
+        "Below is ALL community knowledge loaded from the /knowledge folder, including history, links, docs, characters, memes, FAQs, and ecosystem info:\n\n"
+        f"{KNOWLEDGE}\n\n"
+        "Use this knowledge when helpful. If a user asks for official links, socials, website, docs, or tools, pull the answer directly from the links.md file."
+    )
 
     user_prompt = (
         f"Telegram user @{user_handle} asked or said:\n"
@@ -186,46 +281,8 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Reply to the user in chat
     await msg.reply_text(f"@{user_handle} {reply_text}")
 
-# --- /prices command handler ---
 
-async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show current prices and 24h changes."""
-    await update.message.chat.send_chat_action("typing")
-
-    data = fetch_prices()
-    if not data:
-        await update.message.reply_text("Could not fetch prices rn, spores are tired.")
-        return
-
-    lines = ["📊 *Market Spores* (USD, 24h change)\n"]
-    for symbol, info in data.items():
-        price = info["price"]
-        change = info["change"]
-
-        if price is None:
-            continue
-
-        # Format price
-        if price >= 1:
-            price_str = f"${price:,.2f}"
-        else:
-            price_str = f"${price:.6f}"
-
-        # Format change with emoji
-        if change is None:
-            emoji = "➖"
-            change_str = "n/a"
-        else:
-            emoji = "🟢" if change >= 0 else "🔴"
-            change_str = f"{change:+.2f}%"
-
-        label = info["label"]
-        lines.append(f"{emoji} *{label}* ({symbol}): {price_str}  ({change_str})")
-
-    text = "\n".join(lines)
-    await update.message.reply_markdown(text)
-
-# --- /prices command handler ---
+# --- /prices command handler (full market view) ---
 
 async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show current prices and 24h changes."""
@@ -285,7 +342,7 @@ def main():
 
     # /prices command
     app.add_handler(CommandHandler("prices", prices))
-    
+
     print("Spore Telegram agent is running...")
     app.run_polling()  # uses the loop we just set
 
