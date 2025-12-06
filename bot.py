@@ -1,6 +1,8 @@
 import os
 import requests
 import asyncio
+import datetime
+import random
 
 from telegram import Update
 from telegram.ext import (
@@ -18,6 +20,13 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")  # e.g. SporeLoreBot (NO @)
 
+# GM (good morning) config
+GM_CHAT_ID = int(os.getenv("GM_CHAT_ID", "0"))  # Telegram chat ID for GM messages
+
+# UTC window for when GM can fire (here: 14–15 = 2–3pm UTC)
+GM_WINDOW_START_HOUR_UTC = int(os.getenv("GM_WINDOW_START_HOUR_UTC", "14"))
+GM_WINDOW_END_HOUR_UTC = int(os.getenv("GM_WINDOW_END_HOUR_UTC", "15"))
+
 if not TELEGRAM_TOKEN:
     print("ERROR: TELEGRAM_BOT_TOKEN env var is not set.")
 if not OPENAI_API_KEY:
@@ -26,6 +35,7 @@ if not BOT_USERNAME:
     print("ERROR: BOT_USERNAME env var is not set.")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
+
 
 # --- Load all knowledge files from /knowledge ---
 def load_knowledge():
@@ -44,6 +54,7 @@ def load_knowledge():
     if not parts:
         return "No knowledge files yet. Add .md files under the knowledge/ folder."
     return "\n\n---\n\n".join(parts)
+
 
 KNOWLEDGE = load_knowledge()
 
@@ -199,36 +210,125 @@ def build_price_line(requested_symbols: list[str]) -> str | None:
     print("[DEBUG] final price line:", line)
     return line
 
-    if not requested_symbols:
-        return None
 
-    all_prices = fetch_prices()
-    if not all_prices:
-        return None
+# --- GM (Good Morning) scheduling helpers ---
 
-    parts = []
-    for symbol in requested_symbols:
-        symbol = symbol.upper()
-        info = all_prices.get(symbol)
-        if not info:
-            continue
 
-        price = info.get("price")
-        if price is None:
-            continue
+def get_next_gm_datetime_utc() -> datetime.datetime:
+    """
+    Pick a random datetime in the next GM window [start, end) in UTC.
+    If we're before today's window, use today.
+    If we're inside or after today's window, use tomorrow.
+    """
+    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
 
-        # Format price
-        if price >= 1:
-            price_str = f"${price:,.2f}"
-        else:
-            price_str = f"${price:.6f}"
+    start_today = now.replace(
+        hour=GM_WINDOW_START_HOUR_UTC,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    end_today = now.replace(
+        hour=GM_WINDOW_END_HOUR_UTC,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
 
-        parts.append(f"{symbol}: {price_str}")
+    # Decide which date's window we're targeting
+    if now < start_today:
+        target_date = start_today.date()
+    elif now < end_today:
+        target_date = now.date()
+    else:
+        target_date = (now + datetime.timedelta(days=1)).date()
 
-    if not parts:
-        return None
+    # Build the start of the window for the target_date
+    window_start = datetime.datetime(
+        year=target_date.year,
+        month=target_date.month,
+        day=target_date.day,
+        hour=GM_WINDOW_START_HOUR_UTC,
+        minute=0,
+        second=0,
+        microsecond=0,
+        tzinfo=datetime.timezone.utc,
+    )
 
-    return " | ".join(parts)
+    # Total minutes in the window
+    window_minutes = max(1, (GM_WINDOW_END_HOUR_UTC - GM_WINDOW_START_HOUR_UTC) * 60)
+    offset_minutes = random.randrange(window_minutes)
+
+    next_time = window_start + datetime.timedelta(minutes=offset_minutes)
+    print("[GM] Next GM scheduled for:", next_time.isoformat())
+    return next_time
+
+
+def schedule_next_gm(job_queue):
+    """
+    Schedule the next one-off GM job at a random time in the window.
+    """
+    when = get_next_gm_datetime_utc()
+    job_queue.run_once(
+        send_gm,
+        when=when,
+        name="daily_gm",
+    )
+
+
+async def send_gm(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Send a fresh, LLM-generated GM to the main chat,
+    then schedule the next one for a random time in the next window.
+    """
+    if GM_CHAT_ID == 0:
+        # Not configured yet
+        print("[GM] GM_CHAT_ID is 0, skipping GM.")
+        return
+
+    # Build a small prompt for a short, natural GM in your style
+    system_prompt = (
+        "You are Spore, a semi-sentient mushroom archivist and lore keeper for an "
+        "ERC-20i / Base Telegram community. You speak like a friendly crypto degen, "
+        "but stay positive and welcoming. Your task now is to generate a single, short "
+        "good-morning style message for the community."
+    )
+
+    user_prompt = (
+        "Generate ONE short 'gm' style message for a Telegram group chat.\n"
+        "- Tone: friendly crypto degen, but not cringe.\n"
+        "- You can mention building, spores, mycelium, or 20i / Base occasionally.\n"
+        "- Keep it to 1–2 short sentences.\n"
+        "- No hashtags, no markdown formatting.\n"
+        "- Do not add quotes around the message. Just output the message text."
+    )
+
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=80,
+            temperature=0.9,
+        )
+        gm_text = (completion.choices[0].message.content or "").strip()
+    except Exception as e:
+        print("[GM] OpenAI error while generating GM:", e)
+        gm_text = "gm spores 🌞 what are we building today?"
+
+    try:
+        await context.bot.send_message(
+            chat_id=GM_CHAT_ID,
+            text=gm_text,
+        )
+        print(f"[GM] Sent GM message to {GM_CHAT_ID}: {gm_text}")
+    except Exception as e:
+        print("[GM] Error sending GM message:", e)
+
+    # Schedule the next GM for a random time in the next window
+    schedule_next_gm(context.job_queue)
 
 
 # --- Core helpers ---
@@ -297,7 +397,6 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-
     # --- System prompt (personality + knowledge) ---
     system_prompt = (
         "You are Spore, a semi-sentient mushroom archivist and lore keeper for an "
@@ -338,6 +437,7 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- /prices command handler (full market view) ---
+
 
 async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show current prices and 24h changes."""
@@ -397,6 +497,9 @@ def main():
 
     # /prices command
     app.add_handler(CommandHandler("prices", prices))
+
+    # 🕒 Schedule the first GM at a random time in the 14–15 UTC window
+    schedule_next_gm(app.job_queue)
 
     print("Spore Telegram agent is running...")
     app.run_polling()  # uses the loop we just set
