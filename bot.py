@@ -149,9 +149,56 @@ def extract_price_request_tokens(message_text: str) -> list[str]:
 def build_price_line(requested_symbols: list[str]) -> str | None:
     """
     Uses fetch_prices() and returns a single-line string like:
-    'FUNGI: $0.012345 | PEPI: $0.004200'
+    '🟢 FROGGI: $0.002077 (+3.45%) | 🔴 FUNGI: $0.000123 (-1.23%)'
     Only includes tokens that were successfully priced.
     """
+    if not requested_symbols:
+        return None
+
+    all_prices = fetch_prices()
+    print("[DEBUG] all_prices keys:", list(all_prices.keys()))
+    if not all_prices:
+        return None
+
+    parts = []
+    for symbol in requested_symbols:
+        symbol = symbol.upper()
+        info = all_prices.get(symbol)
+        if not info:
+            print(f"[DEBUG] no price info for {symbol}")
+            continue
+
+        price = info.get("price")
+        change = info.get("change")
+
+        if price is None:
+            print(f"[DEBUG] price is None for {symbol}")
+            continue
+
+        # Format price
+        if price >= 1:
+            price_str = f"${price:,.2f}"
+        else:
+            price_str = f"${price:.6f}"
+
+        # Format 24h change like /prices
+        if change is None:
+            emoji = "➖"
+            change_str = "n/a"
+        else:
+            emoji = "🟢" if change >= 0 else "🔴"
+            change_str = f"{change:+.2f}%"
+
+        parts.append(f"{emoji} {symbol}: {price_str} ({change_str})")
+
+    if not parts:
+        print("[DEBUG] no parts built for price line")
+        return None
+
+    line = " | ".join(parts)
+    print("[DEBUG] final price line:", line)
+    return line
+
     if not requested_symbols:
         return None
 
