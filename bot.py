@@ -215,7 +215,49 @@ async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "\n".join(lines)
     await update.message.reply_markdown(text)
 
-import asyncio  # make sure this is present somewhere near the top of the file
+# --- /prices command handler ---
+
+async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current prices and 24h changes."""
+    msg = update.message
+    if msg is None:
+        return
+
+    await msg.chat.send_chat_action("typing")
+
+    data = fetch_prices()
+    if not data:
+        await msg.reply_text("Could not fetch prices rn, spores are tired.")
+        return
+
+    lines = ["📊 *Market Spores* (USD, 24h change)\n"]
+    for symbol, info in data.items():
+        price = info["price"]
+        change = info["change"]
+
+        if price is None:
+            continue
+
+        # Format price
+        if price >= 1:
+            price_str = f"${price:,.2f}"
+        else:
+            price_str = f"${price:.6f}"
+
+        # Format change with emoji
+        if change is None:
+            emoji = "➖"
+            change_str = "n/a"
+        else:
+            emoji = "🟢" if change >= 0 else "🔴"
+            change_str = f"{change:+.2f}%"
+
+        label = info["label"]
+        lines.append(f"{emoji} *{label}* ({symbol}): {price_str}  ({change_str})")
+
+    text = "\n".join(lines)
+    await msg.reply_markdown(text)
+
 
 def main():
     # Create and set an explicit event loop (needed for Python 3.14)
@@ -231,6 +273,9 @@ def main():
     # Listen to all text messages; our handler decides when to respond
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat))
 
+    # /prices command
+    app.add_handler(CommandHandler("prices", prices))
+    
     print("Spore Telegram agent is running...")
     app.run_polling()  # uses the loop we just set
 
