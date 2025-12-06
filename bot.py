@@ -498,11 +498,20 @@ def main():
     # /prices command
     app.add_handler(CommandHandler("prices", prices))
 
+    # /chatid command (get current chat ID)
+    app.add_handler(CommandHandler("chatid", chatid))
+
     # 🕒 Schedule the first GM at a random time in the 14–15 UTC window
     schedule_next_gm(app.job_queue)
 
     print("Spore Telegram agent is running...")
     app.run_polling()  # uses the loop we just set
+
+# --- /chatid command (for retrieving Telegram chat ID) ---
+
+async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"Chat ID: {chat_id}")
 
 
 if __name__ == "__main__":
