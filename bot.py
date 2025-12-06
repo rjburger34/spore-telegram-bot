@@ -38,6 +38,60 @@ def load_knowledge():
 
 KNOWLEDGE = load_knowledge()
 
+# --- Price config and fetcher ---
+
+import requests  # Required for API calls
+
+TOKEN_CONFIG = {
+    "BTC": {"id": "bitcoin", "label": "Bitcoin"},
+    "ETH": {"id": "ethereum", "label": "Ethereum"},
+    "FUNGI": {"id": "fungi", "label": "Fungi"},
+    "FROGGI": {"id": "froggi", "label": "Froggi"},
+    "PEPI": {"id": "pepi-2", "label": "Pepi"},
+    "JELLI": {"id": "jelli", "label": "Jelli"},
+}
+
+
+COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+
+
+def fetch_prices():
+    """Fetch current price + 24h change for configured tokens."""
+    if not TOKEN_CONFIG:
+        return {}
+
+    ids = ",".join(cfg["id"] for cfg in TOKEN_CONFIG.values())
+
+    params = {
+        "ids": ids,
+        "vs_currencies": "usd",
+        "include_24hr_change": "true",
+    }
+
+    try:
+        resp = requests.get(COINGECKO_URL, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print("Price fetch error:", e)
+        return {}
+
+    results = {}
+    for symbol, cfg in TOKEN_CONFIG.items():
+        cid = cfg["id"]
+        if cid not in data:
+            continue
+        entry = data[cid]
+        price = entry.get("usd")
+        change = entry.get("usd_24h_change")
+        results[symbol] = {
+            "label": cfg["label"],
+            "price": price,
+            "change": change,
+        }
+
+    return results
+
 
 def message_mentions_bot(message_text: str, entities, bot_username: str) -> bool:
     """Return True if the message explicitly @mentions this bot."""
@@ -122,6 +176,44 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Reply to the user in chat
     await msg.reply_text(f"@{user_handle} {reply_text}")
 
+# --- /prices command handler ---
+
+async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current prices and 24h changes."""
+    await update.message.chat.send_chat_action("typing")
+
+    data = fetch_prices()
+    if not data:
+        await update.message.reply_text("Could not fetch prices rn, spores are tired.")
+        return
+
+    lines = ["📊 *Market Spores* (USD, 24h change)\n"]
+    for symbol, info in data.items():
+        price = info["price"]
+        change = info["change"]
+
+        if price is None:
+            continue
+
+        # Format price
+        if price >= 1:
+            price_str = f"${price:,.2f}"
+        else:
+            price_str = f"${price:.6f}"
+
+        # Format change with emoji
+        if change is None:
+            emoji = "➖"
+            change_str = "n/a"
+        else:
+            emoji = "🟢" if change >= 0 else "🔴"
+            change_str = f"{change:+.2f}%"
+
+        label = info["label"]
+        lines.append(f"{emoji} *{label}* ({symbol}): {price_str}  ({change_str})")
+
+    text = "\n".join(lines)
+    await update.message.reply_markdown(text)
 
 import asyncio  # make sure this is present somewhere near the top of the file
 
