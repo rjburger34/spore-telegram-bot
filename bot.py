@@ -220,7 +220,8 @@ def get_next_gm_datetime_utc() -> datetime.datetime:
     If we're before today's window, use today.
     If we're inside or after today's window, use tomorrow.
     """
-    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
 
     start_today = now.replace(
         hour=GM_WINDOW_START_HOUR_UTC,
