@@ -378,10 +378,9 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not clean_question:
         clean_question = "They pinged you without any text. Say hi and explain what you can do."
 
-    user_handle = msg.from_user.username or msg.from_user.first_name
+      user_handle = msg.from_user.username or msg.from_user.first_name
 
     # --- If they wrote /prices as part of a mention/reply, route to the /prices command ---
-    # This catches things like "@SporeLoreBot /prices" that are not seen as a real command
     stripped = clean_question.strip()
     if stripped.startswith("/prices"):
         await prices(update, context)
@@ -390,21 +389,6 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Natural-language price handling ---
     requested_symbols = extract_price_request_tokens(clean_question)
     if requested_symbols:
-        price_line = build_price_line(requested_symbols)
-        if price_line:
-            # Single-line price response, tagged to the user
-            await msg.reply_text(f"@{user_handle} {price_line}")
-            return
-        else:
-            # It *is* a price question for tokens we recognize,
-            # but we couldn't fetch a price (likely API / ID issue).
-            # Do NOT fall back to LLM, or it will spam DexTools links.
-            await msg.reply_text(
-                f"@{user_handle} I can’t fetch live prices for those spores rn. "
-                "Try /prices or double-check if they’re listed on CoinGecko."
-            )
-            return
-
         price_line = build_price_line(requested_symbols)
         if price_line:
             # Single-line price response, tagged to the user
@@ -464,6 +448,8 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- /prices command handler (full market view) ---
 
+# --- /prices command handler (full market view) ---
+
 async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show current prices and 24h changes."""
     msg = update.effective_message
@@ -502,8 +488,9 @@ async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = "\n".join(lines)
 
-    # safest way in PTB 21.x
-    await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    # Use plain string for parse_mode to avoid version issues
+    await msg.reply_text(text, parse_mode="Markdown")
+
 
 
 def main():
