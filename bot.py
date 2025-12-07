@@ -21,6 +21,9 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")  # e.g. SporeLoreBot (NO @)
 
+# Owner (bot creator) – excluded from weekly prize
+OWNER_USER_ID = int(os.getenv("OWNER_USER_ID", "0"))
+
 # GM (good morning) config
 GM_CHAT_ID = int(os.getenv("GM_CHAT_ID", "0"))  # Telegram chat ID for GM messages
 
@@ -34,6 +37,652 @@ if not OPENAI_API_KEY:
     print("ERROR: OPENAI_API_KEY env var is not set.")
 if not BOT_USERNAME:
     print("ERROR: BOT_USERNAME env var is not set.")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# --- Load all knowledge files from /knowledge ---
+def load_knowledge():
+    knowledge_dir = "knowledge"
+    parts = []
+    if os.path.isdir(knowledge_dir):
+        for name in sorted(os.listdir(knowledge_dir)):
+            if name.lower().endswith(".md"):
+                path = os.path.join(knowledge_dir, name)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    parts.append(f"# From {name}\n\n{content}")
+                except Exception as e:
+                    print(f"Could not read {path}: {e}")
+    if not parts:
+        return "No knowledge files yet. Add .md files under the knowledge/ folder."
+    return "\n\n---\n\n".join(parts)
+
+
+KNOWLEDGE = load_knowledge()
+
+# --- Price config and fetcher ---
+
+TOKEN_CONFIG = {
+    "BTC": {"id": "bitcoin", "label": "Bitcoin"},
+    "ETH": {"id": "ethereum", "label": "Ethereum"},
+    "FUNGI": {"id": "fungi", "label": "Fungi"},
+    "FROGGI": {"id": "froggi", "label": "Froggi"},
+    "PEPI": {"id": "pepi-2", "label": "Pepi"},
+    "JELLI": {"id": "jelli", "label": "Jelli"},
+}
+
+COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+
+
+def fetch_prices():
+    """Fetch current price + 24h change for configured tokens."""
+    if not TOKEN_CONFIG:
+        return {}
+
+    ids = ",".join(cfg["id"] for cfg in TOKEN_CONFIG.values())
+
+    params = {
+        "ids": ids,
+        "vs_currencies": "usd",
+        "include_24hr_change": "true",
+    }
+
+    try:
+        resp = requests.get(COINGECKO_URL, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print("Price fetch error:", e)
+        return {}
+
+    results = {}
+    for symbol, cfg in TOKEN_CONFIG.items():
+        cid = cfg["id"]
+        if cid not in data:
+            continue
+        entry = data[cid]
+        price = entry.get("usd")
+        change = entry.get("usd_24h_change")
+        results[symbol] = {
+            "label": cfg["label"],
+            "price": price,
+            "change": change,
+        }
+
+    return results
+
+
+# --- Natural-language price detection helpers ---
+
+TOKEN_ALIASES = {
+    "BTC": ["btc", "$btc", "bitcoin"],
+    "ETH": ["eth", "$eth", "ethereum"],
+    "FUNGI": ["fungi", "$fungi"],
+    "FROGGI": ["froggi", "$froggi"],
+    "PEPI": ["pepi", "$pepi"],
+    "JELLI": ["jelli", "$jelli"],
+}
+
+PRICE_KEYWORDS = [
+    "price",
+    "how much",
+    "worth",
+    "cost",
+    "trading at",
+    "going for",
+    "quote",
+]
+
+
+def extract_price_request_tokens(message_text: str) -> list[str]:
+    """
+    Returns a list of canonical token symbols (e.g. ["FUNGI", "PEPI"])
+    if the message looks like a price request for those tokens.
+    """
+    if not message_text:
+        return []
+
+    text = message_text.lower()
+
+    # Only treat it as a price query if at least one keyword appears
+    if not any(keyword in text for keyword in PRICE_KEYWORDS):
+        return []
+
+    requested = []
+    for symbol, aliases in TOKEN_ALIASES.items():
+        for alias in aliases:
+            if alias in text:
+                requested.append(symbol)
+                break
+
+    return requested
+
+
+def build_price_line(requested_symbols: list[str]) -> str | None:
+    """
+    Uses fetch_prices() and returns a single-line string like:
+    '🟢 FROGGI: $0.002077 (+3.45%) | 🔴 FUNGI: $0.000123 (-1.23%)'
+    Only includes tokens that were successfully priced.
+    """
+    if not requested_symbols:
+        return None
+
+    all_prices = fetch_prices()
+    print("[DEBUG] all_prices keys:", list(all_prices.keys()))
+    if not all_prices:
+        return None
+
+    parts = []
+    for symbol in requested_symbols:
+        symbol = symbol.upper()
+        info = all_prices.get(symbol)
+        if not info:
+            print(f"[DEBUG] no price info for {symbol}")
+            continue
+
+        price = info.get("price")
+        change = info.get("change")
+
+        if price is None:
+            print(f"[DEBUG] price is None for {symbol}")
+            continue
+
+        # Format price
+        if price >= 1:
+            price_str = f"${price:,.2f}"
+        else:
+            price_str = f"${price:.6f}"
+
+        # Format 24h change
+        if change is None:
+            emoji = "➖"
+            change_str = "n/a"
+        else:
+            emoji = "🟢" if change >= 0 else "🔴"
+            change_str = f"{change:+.2f}%"
+
+        parts.append(f"{emoji} {symbol}: {price_str} ({change_str})")
+
+    if not parts:
+        print("[DEBUG] no parts built for price line")
+        return None
+
+    line = " | ".join(parts)
+    print("[DEBUG] final price line:", line)
+    return line
+
+
+# --- Activity tracking (weekly prize) ---
+
+ACTIVITY_FILE = "activity.json"
+
+
+def load_activity():
+    try:
+        with open(ACTIVITY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_activity(data):
+    try:
+        with open(ACTIVITY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print("[ACTIVITY] Error saving activity file:", e)
+
+
+def increment_activity_for_message(msg):
+    """Increment weekly activity counter for a given message's user."""
+    if msg is None or msg.from_user is None:
+        return
+
+    user = msg.from_user
+    if getattr(user, "is_bot", False):
+        return
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    year, week, _ = now.isocalendar()
+    week_key = f"{year}-W{week:02d}"
+
+    data = load_activity()
+    week_data = data.get(week_key, {})
+
+    user_id = str(user.id)
+    entry = week_data.get(user_id, {})
+    entry["count"] = entry.get("count", 0) + 1
+
+    handle = f"@{user.username}" if user.username else user.first_name
+    entry["handle"] = handle
+
+    week_data[user_id] = entry
+    data[week_key] = week_data
+    save_activity(data)
+
+
+async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler that runs on every text message to track activity."""
+    msg = update.effective_message
+    increment_activity_for_message(msg)
+
+
+async def announce_weekly_winner(context: ContextTypes.DEFAULT_TYPE):
+    """Announce the top chatter for the current ISO week, track lifetime wins,
+    and exclude the owner from eligibility.
+    """
+    if GM_CHAT_ID == 0:
+        print("[ACTIVITY] GM_CHAT_ID is 0, skipping weekly winner announcement.")
+        return
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    year, week, _ = now.isocalendar()
+    week_key = f"{year}-W{week:02d}"
+
+    data = load_activity()
+    week_data = data.get(week_key, {})
+
+    if not week_data:
+        print(f"[ACTIVITY] No activity data for {week_key}, skipping.")
+        return
+
+    # Build exclusion set (owner can't win)
+    excluded_ids = set()
+    if OWNER_USER_ID:
+        excluded_ids.add(str(OWNER_USER_ID))
+
+    # Filter out excluded users (e.g. owner)
+    candidates = [
+        (user_id, info)
+        for user_id, info in week_data.items()
+        if user_id not in excluded_ids
+    ]
+
+    if not candidates:
+        print(f"[ACTIVITY] No eligible candidates for {week_key} (all excluded).")
+        return
+
+    # Pick top chatter among eligible users
+    top_user_id, top_info = max(
+        candidates, key=lambda kv: kv[1].get("count", 0)
+    )
+    weekly_count = top_info.get("count", 0)
+    handle = top_info.get("handle") or f"user {top_user_id}"
+
+    # ---- Lifetime wins tracking ----
+    # Store lifetime wins in a special "_wins" bucket so it doesn't collide with week keys
+    wins = data.get("_wins", {})
+    user_win_entry = wins.get(top_user_id, {"count": 0, "handle": handle})
+
+    # Update handle (in case they changed username) and increment total wins
+    user_win_entry["handle"] = handle
+    user_win_entry["count"] = user_win_entry.get("count", 0) + 1
+    total_wins = user_win_entry["count"]
+
+    wins[top_user_id] = user_win_entry
+    data["_wins"] = wins
+
+    # Save wins + weekly data back to disk
+    save_activity(data)
+
+    # Build message with total wins
+    if total_wins == 1:
+        extra_line = (
+            "This is their *first* weekly crown — welcome to the mycelium hall of fame 🍄"
+        )
+    else:
+        extra_line = (
+            f"They've now won this weekly prize *{total_wins}* times. "
+            "Certified chat fungus 🧠🍄"
+        )
+
+    text = (
+        "🌱 Weekly Spore Activity Prize 🌱\n\n"
+        f"Top chatter this week: {handle} with {weekly_count} messages.\n\n"
+        f"{extra_line}"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=GM_CHAT_ID,
+            text=text,
+            parse_mode="Markdown",
+        )
+        print(
+            f"[ACTIVITY] Announced weekly winner {handle} "
+            f"({weekly_count} msgs this week, {total_wins} total wins)"
+        )
+    except Exception as e:
+        print("[ACTIVITY] Error sending weekly winner message:", e)
+
+    # Reset this week's data so next week starts fresh
+    data[week_key] = {}
+    save_activity(data)
+
+
+# --- GM (Good Morning) scheduling helpers ---
+
+
+def get_next_gm_datetime_utc() -> datetime.datetime:
+    """
+    Pick a random datetime in the next GM window [start, end) in UTC.
+    If we're before today's window, use today.
+    If we're inside or after today's window, use tomorrow.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    start_today = now.replace(
+        hour=GM_WINDOW_START_HOUR_UTC,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    end_today = now.replace(
+        hour=GM_WINDOW_END_HOUR_UTC,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+    if now < start_today:
+        target_date = start_today.date()
+    elif now < end_today:
+        target_date = now.date()
+    else:
+        target_date = (now + datetime.timedelta(days=1)).date()
+
+    window_start = datetime.datetime(
+        year=target_date.year,
+        month=target_date.month,
+        day=target_date.day,
+        hour=GM_WINDOW_START_HOUR_UTC,
+        minute=0,
+        second=0,
+        microsecond=0,
+        tzinfo=datetime.timezone.utc,
+    )
+
+    window_minutes = max(1, (GM_WINDOW_END_HOUR_UTC - GM_WINDOW_START_HOUR_UTC) * 60)
+    offset_minutes = random.randrange(window_minutes)
+
+    next_time = window_start + datetime.timedelta(minutes=offset_minutes)
+    print("[GM] Next GM scheduled for:", next_time.isoformat())
+    return next_time
+
+
+def schedule_next_gm(job_queue):
+    """Schedule the next one-off GM job at a random time in the window."""
+    when = get_next_gm_datetime_utc()
+    job_queue.run_once(
+        send_gm,
+        when=when,
+        name="daily_gm",
+    )
+
+
+async def send_gm(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Send a fresh, LLM-generated GM to the main chat,
+    then schedule the next one for a random time in the next window.
+    """
+    if GM_CHAT_ID == 0:
+        print("[GM] GM_CHAT_ID is 0, skipping GM.")
+        return
+
+    system_prompt = (
+        "You are Spore, a semi-sentient mushroom archivist and lore keeper for an "
+        "ERC-20i / Base Telegram community. You speak like a friendly crypto degen, "
+        "but stay positive and welcoming. Your task now is to generate a single, short "
+        "good-morning style message for the community."
+    )
+
+    user_prompt = (
+        "Generate ONE short 'gm' style message for a Telegram group chat.\n"
+        "- Tone: friendly crypto degen, but not cringe.\n"
+        "- You can mention building, spores, mycelium, or 20i / Base occasionally.\n"
+        "- Keep it to 1–2 short sentences.\n"
+        "- No hashtags, no markdown formatting.\n"
+        "- Do not add quotes around the message. Just output the message text."
+    )
+
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=80,
+            temperature=0.9,
+        )
+        gm_text = (completion.choices[0].message.content or "").strip()
+    except Exception as e:
+        print("[GM] OpenAI error while generating GM:", e)
+        gm_text = "gm spores 🌞 what are we building today?"
+
+    try:
+        await context.bot.send_message(
+            chat_id=GM_CHAT_ID,
+            text=gm_text,
+        )
+        print(f"[GM] Sent GM message to {GM_CHAT_ID}: {gm_text}")
+    except Exception as e:
+        print("[GM] Error sending GM message:", e)
+
+    schedule_next_gm(context.job_queue)
+
+
+# --- Core helpers ---
+
+
+def message_mentions_bot(message_text: str, entities, bot_username: str) -> bool:
+    """Return True if the message explicitly @mentions this bot."""
+    if not entities or not message_text:
+        return False
+
+    for ent in entities:
+        if ent.type == "mention":
+            mention_text = message_text[ent.offset : ent.offset + ent.length]
+            if mention_text.lstrip("@").lower() == bot_username.lower():
+                return True
+    return False
+
+
+async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if msg is None or msg.text is None:
+        return
+
+    text = msg.text
+
+    # 1) Trigger on @mention
+    mentioned = message_mentions_bot(text, msg.entities, BOT_USERNAME)
+
+    # 2) Trigger if user is replying directly to the bot
+    is_reply_to_bot = (
+        msg.reply_to_message is not None
+        and msg.reply_to_message.from_user is not None
+        and msg.reply_to_message.from_user.id == context.bot.id
+    )
+
+    if not (mentioned or is_reply_to_bot):
+        return
+
+    # Build the question we send to the LLM
+    if mentioned:
+        clean_question = text.replace(f"@{BOT_USERNAME}", "").strip()
+    else:
+        clean_question = text.strip()
+
+    if not clean_question:
+        clean_question = "They pinged you without any text. Say hi and explain what you can do."
+
+    user_handle = msg.from_user.username or msg.from_user.first_name
+
+    # If they wrote /prices inside a mention, treat it as the /prices command
+    stripped = clean_question.strip()
+    if stripped.startswith("/prices"):
+        await prices(update, context)
+        return
+
+    # Natural-language price queries
+    requested_symbols = extract_price_request_tokens(clean_question)
+    if requested_symbols:
+        price_line = build_price_line(requested_symbols)
+        if price_line:
+            await msg.reply_text(f"@{user_handle} {price_line}")
+            return
+        else:
+            await msg.reply_text(
+                f"@{user_handle} I can’t fetch prices for those spores rn. Try /prices."
+            )
+            return
+
+    # System prompt (personality + knowledge)
+    system_prompt = (
+        "You are Spore, a semi-sentient mushroom archivist and lore keeper for an "
+        "ERC-20i / Base Telegram community.\n"
+        "- You speak like a friendly crypto degen (CT tone) but stay helpful and positive.\n"
+        "- You explain the community's history, culture, key events, characters, memes, links, and tools.\n"
+        "- Keep replies short and group-chat friendly (1–3 short paragraphs or a few lines).\n"
+        "- If you don't know something, say you're not sure and suggest asking mods or checking official resources.\n\n"
+        "Below is ALL community knowledge loaded from the /knowledge folder, including history, links, docs, characters, memes, FAQs, and ecosystem info:\n\n"
+        f"{KNOWLEDGE}\n\n"
+        "Use this knowledge when helpful. If a user asks for official links, socials, website, docs, or tools, pull the answer directly from the links.md file."
+    )
+
+    user_prompt = (
+        f"Telegram user @{user_handle} asked or said:\n"
+        f"{clean_question}\n\n"
+        "Reply as Spore in a busy group chat. Address them directly, keep it casual and concise."
+    )
+
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=250,
+            temperature=0.8,
+        )
+        reply_text = completion.choices[0].message.content.strip()
+    except Exception as e:
+        print("OpenAI error:", e)
+        reply_text = "My spores are clogged rn, try again in a bit."
+
+    await msg.reply_text(f"@{user_handle} {reply_text}")
+
+
+# --- /prices command handler (full market view) ---
+
+
+async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current prices and 24h changes."""
+    msg = update.effective_message
+    if msg is None:
+        return
+
+    data = fetch_prices()
+    if not data:
+        await msg.reply_text("Could not fetch prices rn, spores are tired.")
+        return
+
+    lines = ["📊 *Market Spores* (USD, 24h change)\n"]
+    for symbol, info in data.items():
+        price = info["price"]
+        change = info["change"]
+
+        if price is None:
+            continue
+
+        if price >= 1:
+            price_str = f"${price:,.2f}"
+        else:
+            price_str = f"${price:.6f}"
+
+        if change is None:
+            emoji = "➖"
+            change_str = "n/a"
+        else:
+            emoji = "🟢" if change >= 0 else "🔴"
+            change_str = f"{change:+.2f}%"
+
+        label = info["label"]
+        lines.append(f"{emoji} *{label}* ({symbol}): {price_str}  ({change_str})")
+
+    text = "\n".join(lines)
+    await msg.reply_text(text, parse_mode="Markdown")
+
+
+# --- /chatid command (for retrieving Telegram chat ID) ---
+
+
+async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"Chat ID: {chat_id}")
+
+
+# --- /whoami command (to get your numeric Telegram user id) ---
+
+
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    handle = f"@{user.username}" if user.username else user.first_name
+    await update.message.reply_text(
+        f"Handle: {handle}\nYour Telegram user ID: {user.id}"
+    )
+
+
+def main():
+    # Create and set an explicit event loop (needed for Python 3.14)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    if not TELEGRAM_TOKEN or not OPENAI_API_KEY or not BOT_USERNAME:
+        print("Missing required environment variables. Exiting.")
+        return
+
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # Global activity tracker (runs on ALL text messages)
+    app.add_handler(MessageHandler(filters.TEXT, track_activity), group=0)
+
+    # Lore / reply handler (only when mentioned or replied to)
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat),
+        group=1,
+    )
+
+    # /prices command
+    app.add_handler(CommandHandler("prices", prices))
+
+    # /chatid command
+    app.add_handler(CommandHandler("chatid", chatid))
+
+    # /whoami command
+    app.add_handler(CommandHandler("whoami", whoami))
+
+    # Schedule daily GM
+    schedule_next_gm(app.job_queue)
+
+    # Schedule weekly activity winner: Sunday 23:59 UTC (Sunday = 6 in Python)
+    app.job_queue.run_daily(
+        announce_weekly_winner,
+        time=datetime.time(hour=23, minute=59, tzinfo=datetime.timezone.utc),
+        days=(6,),
+        name="weekly_activity_winner",
+    )
+
+    print("Spore Telegram agent is running...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
