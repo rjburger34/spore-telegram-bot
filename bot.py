@@ -378,13 +378,61 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not clean_question:
         clean_question = "They pinged you without any text. Say hi and explain what you can do."
 
-      user_handle = msg.from_user.username or msg.from_user.first_name
+    user_handle = msg.from_user.username or msg.from_user.first_name
 
-    # --- If they wrote /prices as part of a mention/reply, route to the /prices command ---
+    # --- If user typed "/prices" inside a mention, treat it as a real command ---
     stripped = clean_question.strip()
     if stripped.startswith("/prices"):
         await prices(update, context)
         return
+
+    # --- Natural-language price queries ---
+    requested_symbols = extract_price_request_tokens(clean_question)
+    if requested_symbols:
+        price_line = build_price_line(requested_symbols)
+        if price_line:
+            await msg.reply_text(f"@{user_handle} {price_line}")
+            return
+        else:
+            await msg.reply_text(
+                f"@{user_handle} I can’t fetch prices for those spores rn. Try /prices."
+            )
+            return
+
+    # --- System prompt (LLM personality + lore) ---
+    system_prompt = (
+        "You are Spore, a semi-sentient mushroom archivist and lore keeper for an "
+        "ERC-20i / Base Telegram community.\n"
+        "- You speak like a friendly crypto degen (CT tone) but stay helpful and positive.\n"
+        "- Keep replies short and group-chat friendly.\n"
+        "- If you don't know something, say you're not sure.\n\n"
+        f"{KNOWLEDGE}"
+    )
+
+    user_prompt = (
+        f"Telegram user @{user_handle} asked or said:\n"
+        f"{clean_question}\n\n"
+        "Reply as Spore in a busy group chat."
+    )
+
+    # --- Call OpenAI LLM ---
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=250,
+            temperature=0.8,
+        )
+        reply_text = completion.choices[0].message.content.strip()
+    except Exception as e:
+        print("OpenAI error:", e)
+        reply_text = "My spores are clogged rn, try again in a bit."
+
+    await msg.reply_text(f"@{user_handle} {reply_text}")
+
 
     # --- Natural-language price handling ---
     requested_symbols = extract_price_request_tokens(clean_question)
