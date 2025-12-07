@@ -440,13 +440,13 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- /prices command handler (full market view) ---
 
 
+# --- /prices command handler (full market view) ---
+
 async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show current prices and 24h changes."""
-    msg = update.message
+    msg = update.effective_message
     if msg is None:
         return
-
-    await msg.chat.send_chat_action("typing")
 
     data = fetch_prices()
     if not data:
@@ -479,7 +479,9 @@ async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{emoji} *{label}* ({symbol}): {price_str}  ({change_str})")
 
     text = "\n".join(lines)
-    await msg.reply_markdown(text)
+
+    # safest way in PTB 21.x
+    await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
 def main():
