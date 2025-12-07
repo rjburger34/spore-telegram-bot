@@ -112,7 +112,6 @@ def fetch_prices():
 
 # --- Natural-language price detection helpers ---
 
-# Map canonical symbols (keys from TOKEN_CONFIG) to aliases people will type
 TOKEN_ALIASES = {
     "BTC": ["btc", "$btc", "bitcoin"],
     "ETH": ["eth", "$eth", "ethereum"],
@@ -152,7 +151,7 @@ def extract_price_request_tokens(message_text: str) -> list[str]:
         for alias in aliases:
             if alias in text:
                 requested.append(symbol)
-                break  # don't double-add the same symbol
+                break
 
     return requested
 
@@ -192,7 +191,7 @@ def build_price_line(requested_symbols: list[str]) -> str | None:
         else:
             price_str = f"${price:.6f}"
 
-        # Format 24h change like /prices
+        # Format 24h change
         if change is None:
             emoji = "➖"
             change_str = "n/a"
@@ -222,7 +221,6 @@ def get_next_gm_datetime_utc() -> datetime.datetime:
     """
     now = datetime.datetime.now(datetime.timezone.utc)
 
-
     start_today = now.replace(
         hour=GM_WINDOW_START_HOUR_UTC,
         minute=0,
@@ -236,7 +234,6 @@ def get_next_gm_datetime_utc() -> datetime.datetime:
         microsecond=0,
     )
 
-    # Decide which date's window we're targeting
     if now < start_today:
         target_date = start_today.date()
     elif now < end_today:
@@ -244,7 +241,6 @@ def get_next_gm_datetime_utc() -> datetime.datetime:
     else:
         target_date = (now + datetime.timedelta(days=1)).date()
 
-    # Build the start of the window for the target_date
     window_start = datetime.datetime(
         year=target_date.year,
         month=target_date.month,
@@ -256,7 +252,6 @@ def get_next_gm_datetime_utc() -> datetime.datetime:
         tzinfo=datetime.timezone.utc,
     )
 
-    # Total minutes in the window
     window_minutes = max(1, (GM_WINDOW_END_HOUR_UTC - GM_WINDOW_START_HOUR_UTC) * 60)
     offset_minutes = random.randrange(window_minutes)
 
@@ -266,9 +261,7 @@ def get_next_gm_datetime_utc() -> datetime.datetime:
 
 
 def schedule_next_gm(job_queue):
-    """
-    Schedule the next one-off GM job at a random time in the window.
-    """
+    """Schedule the next one-off GM job at a random time in the window."""
     when = get_next_gm_datetime_utc()
     job_queue.run_once(
         send_gm,
@@ -283,11 +276,9 @@ async def send_gm(context: ContextTypes.DEFAULT_TYPE):
     then schedule the next one for a random time in the next window.
     """
     if GM_CHAT_ID == 0:
-        # Not configured yet
         print("[GM] GM_CHAT_ID is 0, skipping GM.")
         return
 
-    # Build a small prompt for a short, natural GM in your style
     system_prompt = (
         "You are Spore, a semi-sentient mushroom archivist and lore keeper for an "
         "ERC-20i / Base Telegram community. You speak like a friendly crypto degen, "
@@ -328,7 +319,6 @@ async def send_gm(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print("[GM] Error sending GM message:", e)
 
-    # Schedule the next GM for a random time in the next window
     schedule_next_gm(context.job_queue)
 
 
@@ -366,7 +356,6 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if not (mentioned or is_reply_to_bot):
-        # Ignore everything else in the group
         return
 
     # Build the question we send to the LLM
@@ -380,13 +369,13 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_handle = msg.from_user.username or msg.from_user.first_name
 
-    # --- If user typed "/prices" inside a mention, treat it as a real command ---
+    # If they wrote /prices inside a mention, treat it as the /prices command
     stripped = clean_question.strip()
     if stripped.startswith("/prices"):
         await prices(update, context)
         return
 
-    # --- Natural-language price queries ---
+    # Natural-language price queries
     requested_symbols = extract_price_request_tokens(clean_question)
     if requested_symbols:
         price_line = build_price_line(requested_symbols)
@@ -399,60 +388,7 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # --- System prompt (LLM personality + lore) ---
-    system_prompt = (
-        "You are Spore, a semi-sentient mushroom archivist and lore keeper for an "
-        "ERC-20i / Base Telegram community.\n"
-        "- You speak like a friendly crypto degen (CT tone) but stay helpful and positive.\n"
-        "- Keep replies short and group-chat friendly.\n"
-        "- If you don't know something, say you're not sure.\n\n"
-        f"{KNOWLEDGE}"
-    )
-
-    user_prompt = (
-        f"Telegram user @{user_handle} asked or said:\n"
-        f"{clean_question}\n\n"
-        "Reply as Spore in a busy group chat."
-    )
-
-    # --- Call OpenAI LLM ---
-    try:
-        completion = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=250,
-            temperature=0.8,
-        )
-        reply_text = completion.choices[0].message.content.strip()
-    except Exception as e:
-        print("OpenAI error:", e)
-        reply_text = "My spores are clogged rn, try again in a bit."
-
-    await msg.reply_text(f"@{user_handle} {reply_text}")
-
-
-    # --- Natural-language price handling ---
-    requested_symbols = extract_price_request_tokens(clean_question)
-    if requested_symbols:
-        price_line = build_price_line(requested_symbols)
-        if price_line:
-            # Single-line price response, tagged to the user
-            await msg.reply_text(f"@{user_handle} {price_line}")
-            return
-        else:
-            # It *is* a price question for tokens we recognize,
-            # but we couldn't fetch a price (likely API / ID issue).
-            # Do NOT fall back to LLM, or it will spam DexTools links.
-            await msg.reply_text(
-                f"@{user_handle} I can’t fetch live prices for those spores rn. "
-                "Try /prices or double-check if they’re listed on CoinGecko."
-            )
-            return
-
-    # --- System prompt (personality + knowledge) ---
+    # System prompt (personality + knowledge)
     system_prompt = (
         "You are Spore, a semi-sentient mushroom archivist and lore keeper for an "
         "ERC-20i / Base Telegram community.\n"
@@ -471,10 +407,9 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Reply as Spore in a busy group chat. Address them directly, keep it casual and concise."
     )
 
-    # --- Call OpenAI LLM ---
     try:
         completion = client.chat.completions.create(
-            model="gpt-4.1-mini",  # or gpt-4.1-nano if you want cheaper
+            model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -487,16 +422,11 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print("OpenAI error:", e)
         reply_text = "My spores are clogged rn, try again in a bit."
 
-    # Reply to the user in chat
     await msg.reply_text(f"@{user_handle} {reply_text}")
 
 
 # --- /prices command handler (full market view) ---
 
-
-# --- /prices command handler (full market view) ---
-
-# --- /prices command handler (full market view) ---
 
 async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show current prices and 24h changes."""
@@ -517,13 +447,11 @@ async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if price is None:
             continue
 
-        # Format price
         if price >= 1:
             price_str = f"${price:,.2f}"
         else:
             price_str = f"${price:.6f}"
 
-        # Format change with emoji
         if change is None:
             emoji = "➖"
             change_str = "n/a"
@@ -535,10 +463,15 @@ async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{emoji} *{label}* ({symbol}): {price_str}  ({change_str})")
 
     text = "\n".join(lines)
-
-    # Use plain string for parse_mode to avoid version issues
     await msg.reply_text(text, parse_mode="Markdown")
 
+
+# --- /chatid command (for retrieving Telegram chat ID) ---
+
+
+async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"Chat ID: {chat_id}")
 
 
 def main():
@@ -558,20 +491,14 @@ def main():
     # /prices command
     app.add_handler(CommandHandler("prices", prices))
 
-    # /chatid command (get current chat ID)
+    # /chatid command
     app.add_handler(CommandHandler("chatid", chatid))
 
-    # 🕒 Schedule the first GM at a random time in the 14–15 UTC window
+    # Schedule the first GM at a random time in the 14–15 UTC window
     schedule_next_gm(app.job_queue)
 
     print("Spore Telegram agent is running...")
-    app.run_polling()  # uses the loop we just set
-
-# --- /chatid command (for retrieving Telegram chat ID) ---
-
-async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    await update.message.reply_text(f"Chat ID: {chat_id}")
+    app.run_polling()
 
 
 if __name__ == "__main__":
