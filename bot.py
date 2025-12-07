@@ -1,4 +1,5 @@
 import os
+import json
 import requests
 import asyncio
 import datetime
@@ -208,6 +209,131 @@ def build_price_line(requested_symbols: list[str]) -> str | None:
     line = " | ".join(parts)
     print("[DEBUG] final price line:", line)
     return line
+
+
+# --- Activity tracking (weekly prize) ---
+
+ACTIVITY_FILE = "activity.json"
+
+
+def load_activity():
+    try:
+        with open(ACTIVITY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_activity(data):
+    try:
+        with open(ACTIVITY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print("[ACTIVITY] Error saving activity file:", e)
+
+
+def increment_activity_for_message(msg):
+    """Increment weekly activity counter for a given message's user."""
+    if msg is None or msg.from_user is None:
+        return
+
+    user = msg.from_user
+    if getattr(user, "is_bot", False):
+        return
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    year, week, _ = now.isocalendar()
+    week_key = f"{year}-W{week:02d}"
+
+    data = load_activity()
+    week_data = data.get(week_key, {})
+
+    user_id = str(user.id)
+    entry = week_data.get(user_id, {})
+    entry["count"] = entry.get("count", 0) + 1
+
+    handle = f"@{user.username}" if user.username else user.first_name
+    entry["handle"] = handle
+
+    week_data[user_id] = entry
+    data[week_key] = week_data
+    save_activity(data)
+
+
+async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler that runs on every text message to track activity."""
+    msg = update.effective_message
+    increment_activity_for_message(msg)
+
+
+async def announce_weekly_winner(context: ContextTypes.DEFAULT_TYPE):
+    """Announce the top chatter for the current ISO week and track lifetime wins."""
+    if GM_CHAT_ID == 0:
+        print("[ACTIVITY] GM_CHAT_ID is 0, skipping weekly winner announcement.")
+        return
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    year, week, _ = now.isocalendar()
+    week_key = f"{year}-W{week:02d}"
+
+    data = load_activity()
+    week_data = data.get(week_key, {})
+
+    if not week_data:
+        print(f"[ACTIVITY] No activity data for {week_key}, skipping.")
+        return
+
+    # Find the top chatter this week
+    top_user_id, top_info = max(
+        week_data.items(), key=lambda kv: kv[1].get("count", 0)
+    )
+    weekly_count = top_info.get("count", 0)
+    handle = top_info.get("handle") or f"user {top_user_id}"
+
+    # ---- Lifetime wins tracking ----
+    # Store lifetime wins in a special "_wins" bucket so it doesn't collide with week keys
+    wins = data.get("_wins", {})
+    user_win_entry = wins.get(top_user_id, {"count": 0, "handle": handle})
+
+    # Update handle (in case they changed username) and increment total wins
+    user_win_entry["handle"] = handle
+    user_win_entry["count"] = user_win_entry.get("count", 0) + 1
+    total_wins = user_win_entry["count"]
+
+    wins[top_user_id] = user_win_entry
+    data["_wins"] = wins
+
+    # Save wins + weekly data back to disk
+    save_activity(data)
+
+    # Build message with total wins
+    if total_wins == 1:
+        extra_line = "This is their *first* weekly crown — welcome to the mycelium hall of fame 🍄"
+    else:
+        extra_line = f"They've now won this weekly prize *{total_wins}* times. Certified chat fungus 🧠🍄"
+
+    text = (
+        "🌱 Weekly Spore Activity Prize 🌱\n\n"
+        f"Top chatter this week: {handle} with {weekly_count} messages.\n\n"
+        f"{extra_line}"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=GM_CHAT_ID,
+            text=text,
+            parse_mode="Markdown",
+        )
+        print(
+            f"[ACTIVITY] Announced weekly winner {handle} "
+            f"({weekly_count} msgs this week, {total_wins} total wins)"
+        )
+    except Exception as e:
+        print("[ACTIVITY] Error sending weekly winner message:", e)
+
+    # Reset this week's data so next week starts fresh
+    data[week_key] = {}
+    save_activity(data)
 
 
 # --- GM (Good Morning) scheduling helpers ---
@@ -485,8 +611,14 @@ def main():
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Listen to all text messages; our handler decides when to respond
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat))
+    # Global activity tracker (runs on ALL text messages)
+    app.add_handler(MessageHandler(filters.TEXT, track_activity), group=0)
+
+    # Lore / reply handler (only when mentioned or replied to)
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat),
+        group=1,
+    )
 
     # /prices command
     app.add_handler(CommandHandler("prices", prices))
@@ -494,8 +626,16 @@ def main():
     # /chatid command
     app.add_handler(CommandHandler("chatid", chatid))
 
-    # Schedule the first GM at a random time in the 14–15 UTC window
+    # Schedule daily GM
     schedule_next_gm(app.job_queue)
+
+    # Schedule weekly activity winner: Sunday 23:59 UTC (Sunday = 6 in Python)
+    app.job_queue.run_daily(
+        announce_weekly_winner,
+        time=datetime.time(hour=23, minute=59, tzinfo=datetime.timezone.utc),
+        days=(6,),
+        name="weekly_activity_winner",
+    )
 
     print("Spore Telegram agent is running...")
     app.run_polling()
