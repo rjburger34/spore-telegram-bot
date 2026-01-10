@@ -495,6 +495,8 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg is None or msg.text is None:
         return
 
+    print(f"[DEBUG] Chat ID: {update.effective_chat.id}")
+
     text = msg.text
 
     # 1) Trigger on @mention
