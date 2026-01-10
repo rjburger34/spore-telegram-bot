@@ -579,6 +579,22 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(f"@{user_handle} {reply_text}")
 
 
+async def posttest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id_str = os.getenv("GM_CHAT_ID", "").strip()
+    if not chat_id_str:
+        await update.message.reply_text("GM_CHAT_ID is not set in Railway variables.")
+        return
+
+    try:
+        chat_id = int(chat_id_str)
+    except ValueError:
+        await update.message.reply_text("GM_CHAT_ID is invalid (must be an integer).")
+        return
+
+    await context.bot.send_message(chat_id=chat_id, text="✅ Spore automation test message (GM_CHAT_ID works).")
+    await update.message.reply_text("Sent a test message to GM_CHAT_ID.")
+
+
 # --- /prices command handler (full market view) ---
 
 
