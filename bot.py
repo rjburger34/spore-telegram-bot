@@ -16,24 +16,322 @@ from telegram.ext import (
 from openai import OpenAI
 
 
-# -----------------------------
-# Config (env vars)
-# -----------------------------
+# =============================
+# ENV CONFIG
+# =============================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "")  # e.g. SporeLoreBot (NO @)
+BOT_USERNAME = os.getenv("BOT_USERNAME", "")  # no @
 
-# Owner excluded from weekly prize
 OWNER_USER_ID = int(os.getenv("OWNER_USER_ID", "0"))
-
-# Weekly award target chat
 WEEKLY_AWARD_CHAT_ID = int(os.getenv("WEEKLY_AWARD_CHAT_ID", "0"))
 
-# GM optional
-ENABLE_GM = os.getenv("ENABLE_GM", "0").strip() in ("1", "true", "True", "yes", "YES")
-GM_CHAT_ID = int(os.getenv("GM_CHAT_ID", "0"))  # target chat for GM (optional)
+ENABLE_GM = os.getenv("ENABLE_GM", "0").lower() in ("1", "true", "yes")
+GM_CHAT_ID = int(os.getenv("GM_CHAT_ID", "0"))
 GM_WINDOW_START_HOUR_UTC = int(os.getenv("GM_WINDOW_START_HOUR_UTC", "14"))
 GM_WINDOW_END_HOUR_UTC = int(os.getenv("GM_WINDOW_END_HOUR_UTC", "15"))
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# =============================
+# KNOWLEDGE LOADER
+# =============================
+def load_knowledge() -> str:
+    parts = []
+    if os.path.isdir("knowledge"):
+        for fname in sorted(os.listdir("knowledge")):
+            if fname.lower().endswith(".md"):
+                try:
+                    with open(f"knowledge/{fname}", "r", encoding="utf-8") as f:
+                        parts.append(f"# From {fname}\n\n{f.read()}")
+                except Exception as e:
+                    print(f"[KNOWLEDGE] Failed to read {fname}: {e}")
+    return "\n\n---\n\n".join(parts) if parts else "No knowledge files loaded."
+
+
+KNOWLEDGE = load_knowledge()
+
+
+# =============================
+# PRICE FETCHING
+# =============================
+TOKEN_CONFIG = {
+    "BTC": {"id": "bitcoin", "label": "Bitcoin"},
+    "ETH": {"id": "ethereum", "label": "Ethereum"},
+    "FUNGI": {"id": "fungi", "label": "Fungi"},
+    "FROGGI": {"id": "froggi", "label": "Froggi"},
+    "PEPI": {"id": "pepi-2", "label": "Pepi"},
+    "JELLI": {"id": "jelli", "label": "Jelli"},
+}
+
+COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+
+
+def fetch_prices():
+    ids = ",".join(cfg["id"] for cfg in TOKEN_CONFIG.values())
+    try:
+        r = requests.get(
+            COINGECKO_URL,
+            params={"ids": ids, "vs_currencies": "usd", "include_24hr_change": "true"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print("[PRICES] Fetch error:", e)
+        return {}
+
+    out = {}
+    for sym, cfg in TOKEN_CONFIG.items():
+        d = data.get(cfg["id"])
+        if not d:
+            continue
+        out[sym] = {
+            "label": cfg["label"],
+            "price": d.get("usd"),
+            "change": d.get("usd_24h_change"),
+        }
+    return out
+
+
+TOKEN_ALIASES = {
+    "BTC": ["btc", "$btc", "bitcoin"],
+    "ETH": ["eth", "$eth", "ethereum"],
+    "FUNGI": ["fungi", "$fungi"],
+    "FROGGI": ["froggi", "$froggi"],
+    "PEPI": ["pepi", "$pepi"],
+    "JELLI": ["jelli", "$jelli"],
+}
+
+PRICE_KEYWORDS = ["price", "how much", "worth", "cost", "trading", "quote"]
+
+
+def extract_price_request(text: str) -> list[str]:
+    t = text.lower()
+    if not any(k in t for k in PRICE_KEYWORDS):
+        return []
+    return [s for s, aliases in TOKEN_ALIASES.items() if any(a in t for a in aliases)]
+
+
+def build_price_line(symbols: list[str]) -> str | None:
+    prices = fetch_prices()
+    parts = []
+    for s in symbols:
+        info = prices.get(s)
+        if not info or info["price"] is None:
+            continue
+        p = info["price"]
+        c = info["change"]
+        price_str = f"${p:,.2f}" if p >= 1 else f"${p:.6f}"
+        emoji = "➖" if c is None else ("🟢" if c >= 0 else "🔴")
+        change_str = "n/a" if c is None else f"{c:+.2f}%"
+        parts.append(f"{emoji} {s}: {price_str} ({change_str})")
+    return " | ".join(parts) if parts else None
+
+
+# =============================
+# ACTIVITY TRACKING
+# =============================
+ACTIVITY_FILE = "activity.json"
+
+
+def load_activity():
+    try:
+        with open(ACTIVITY_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_activity(data):
+    with open(ACTIVITY_FILE, "w") as f:
+        json.dump(data, f)
+
+
+def increment_activity(msg):
+    if not msg or not msg.from_user or msg.from_user.is_bot:
+        return
+    now = datetime.datetime.now(datetime.timezone.utc)
+    wk = f"{now.isocalendar()[0]}-W{now.isocalendar()[1]:02d}"
+    data = load_activity()
+    w = data.setdefault(wk, {})
+    uid = str(msg.from_user.id)
+    entry = w.setdefault(uid, {"count": 0})
+    entry["count"] += 1
+    entry["handle"] = f"@{msg.from_user.username}" if msg.from_user.username else msg.from_user.first_name
+    save_activity(data)
+
+
+async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    increment_activity(update.effective_message)
+
+
+async def announce_weekly_winner(context: ContextTypes.DEFAULT_TYPE):
+    if WEEKLY_AWARD_CHAT_ID == 0:
+        return
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    wk = f"{now.isocalendar()[0]}-W{now.isocalendar()[1]:02d}"
+    data = load_activity()
+    w = data.get(wk, {})
+
+    candidates = {u: v for u, v in w.items() if u != str(OWNER_USER_ID)}
+    if not candidates:
+        return
+
+    uid, info = max(candidates.items(), key=lambda kv: kv[1]["count"])
+    text = (
+        "🌱 Weekly Spore Activity Prize 🌱\n\n"
+        f"Top chatter: {info['handle']} ({info['count']} msgs)"
+    )
+
+    await context.bot.send_message(chat_id=WEEKLY_AWARD_CHAT_ID, text=text)
+    data[wk] = {}
+    save_activity(data)
+
+
+# =============================
+# CORE CHAT HANDLER
+# =============================
+def mentions_bot(text, entities):
+    if not entities:
+        return False
+    for e in entities:
+        if e.type == "mention":
+            if text[e.offset : e.offset + e.length].lstrip("@").lower() == BOT_USERNAME.lower():
+                return True
+    return False
+
+
+async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.text:
+        return
+
+    text = msg.text
+    mentioned = mentions_bot(text, msg.entities)
+    reply_to_bot = msg.reply_to_message and msg.reply_to_message.from_user.id == context.bot.id
+
+    if not (mentioned or reply_to_bot):
+        return
+
+    clean = text.replace(f"@{BOT_USERNAME}", "").strip()
+
+    # Allow commands inside mentions
+    if clean.startswith("/posttest"):
+        await posttest(update, context)
+        return
+    if clean.startswith("/prices"):
+        await prices(update, context)
+        return
+
+    price_syms = extract_price_request(clean)
+    if price_syms:
+        line = build_price_line(price_syms)
+        if line:
+            await msg.reply_text(line)
+            return
+
+    system = (
+        "You are Spore, a semi-sentient mushroom archivist for an ERC-20i Telegram community.\n"
+        "Be friendly, concise, and helpful.\n\n"
+        f"{KNOWLEDGE}"
+    )
+
+    user = msg.from_user.username or msg.from_user.first_name
+    prompt = f"User @{user} said:\n{clean}"
+
+    try:
+        r = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            max_tokens=250,
+        )
+        reply = r.choices[0].message.content.strip()
+    except Exception:
+        reply = "My spores are clogged rn, try again in a bit."
+
+    await msg.reply_text(reply)
+
+
+# =============================
+# COMMANDS
+# =============================
+async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = fetch_prices()
+    if not data:
+        await update.message.reply_text("Price spores are tired rn.")
+        return
+
+    lines = ["📊 Market Spores\n"]
+    for s, i in data.items():
+        p = i["price"]
+        c = i["change"]
+        if p is None:
+            continue
+        ps = f"${p:,.2f}" if p >= 1 else f"${p:.6f}"
+        emoji = "➖" if c is None else ("🟢" if c >= 0 else "🔴")
+        cs = "n/a" if c is None else f"{c:+.2f}%"
+        lines.append(f"{emoji} {i['label']} ({s}): {ps} ({cs})")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def posttest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if WEEKLY_AWARD_CHAT_ID:
+        await context.bot.send_message(
+            chat_id=WEEKLY_AWARD_CHAT_ID,
+            text="✅ Spore automation test message (weekly award chat)",
+        )
+        await update.message.reply_text("Automation test sent.")
+    else:
+        await update.message.reply_text("WEEKLY_AWARD_CHAT_ID not set.")
+
+
+async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Chat ID: {update.effective_chat.id}")
+
+
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    await update.message.reply_text(f"@{u.username}\nUser ID: {u.id}")
+
+
+# =============================
+# MAIN
+# =============================
+def main():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # Track activity (NO commands)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_activity), group=0)
+
+    # Commands
+    app.add_handler(CommandHandler("prices", prices))
+    app.add_handler(CommandHandler("posttest", posttest))
+    app.add_handler(CommandHandler("chatid", chatid))
+    app.add_handler(CommandHandler("whoami", whoami))
+
+    # LLM replies
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat), group=1)
+
+    # Weekly award (Sunday 23:59 UTC)
+    app.job_queue.run_daily(
+        announce_weekly_winner,
+        time=datetime.time(hour=23, minute=59, tzinfo=datetime.timezone.utc),
+        days=(6,),
+    )
+
+    print("Spore Telegram agent is running...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
 
 if not TELEGRAM_TOKEN:
     print("ERROR: TELEGRAM_BOT_TOKEN env var is not set.")
